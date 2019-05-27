@@ -1,0 +1,347 @@
+---
+kind: Namespace
+apiVersion: v1
+metadata:
+  name: elkki
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fluent-bit
+  namespace: elkki
+---
+apiVersion: rbac.authorization.k8s.io/v1beta1
+kind: ClusterRole
+metadata:
+  name: fluent-bit-read
+rules:
+- apiGroups: [""]
+  resources:
+  - namespaces
+  - pods
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1beta1
+kind: ClusterRoleBinding
+metadata:
+  name: fluent-bit-read
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: fluent-bit-read
+subjects:
+- kind: ServiceAccount
+  name: fluent-bit
+  namespace: elkki
+---
+kind: Service
+apiVersion: v1
+metadata:
+  name: elasticsearch
+  namespace: elkki
+  labels:
+    app: elasticsearch
+spec:
+  selector:
+    app: elasticsearch
+  clusterIP: None
+  ports:
+    - port: 9200
+      name: rest
+    - port: 9300
+      name: inter-node
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: es-cluster
+  namespace: elkki
+spec:
+  serviceName: elasticsearch
+  replicas: 2
+  selector:
+    matchLabels:
+      app: elasticsearch
+  template:
+    metadata:
+      labels:
+        app: elasticsearch
+    spec:
+      containers:
+      - name: elasticsearch
+        image: docker.elastic.co/elasticsearch/elasticsearch:7.0.1
+        resources:
+            limits:
+              cpu: 3000m
+            requests:
+              memory: 2048Mi
+              cpu: 100m
+        ports:
+        - containerPort: 9200
+          name: rest
+          protocol: TCP
+        - containerPort: 9300
+          name: inter-node
+          protocol: TCP
+        volumeMounts:
+        - name: data
+          mountPath: /usr/share/elasticsearch/data
+        env:
+          - name: cluster.name
+            value: k8s-logs
+          - name: node.name
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.name
+          - name: cluster.initial_master_nodes
+            value: "es-cluster-0,es-cluster-1"
+          - name: discovery.zen.ping.unicast.hosts
+            value: "es-cluster-0.elasticsearch,es-cluster-1.elasticsearch"
+          - name: discovery.zen.minimum_master_nodes
+            value: "1"
+          - name: ES_JAVA_OPTS
+            value: "-Xms1024m -Xmx1024m"
+      initContainers:
+      - name: fix-permissions
+        image: busybox
+        command: ["sh", "-c", "chown -R 1000:1000 /usr/share/elasticsearch/data"]
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - name: data
+          mountPath: /usr/share/elasticsearch/data
+      - name: increase-vm-max-map
+        image: busybox
+        command: ["sysctl", "-w", "vm.max_map_count=262144"]
+        securityContext:
+          privileged: true
+      - name: increase-fd-ulimit
+        image: busybox
+        command: ["sh", "-c", "ulimit -n 65536"]
+        securityContext:
+          privileged: true
+      volumes:
+      - name: data
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kibana
+  namespace: elkki
+  labels:
+    app: kibana
+spec:
+  ports:
+  - port: 5601
+  selector:
+    app: kibana
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kibana
+  namespace: elkki
+  labels:
+    app: kibana
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: kibana
+  template:
+    metadata:
+      labels:
+        app: kibana
+    spec:
+      containers:
+      - name: kibana
+        image: docker.elastic.co/kibana/kibana:7.0.1
+        resources:
+          limits:
+            cpu: 1000m
+          requests:
+            cpu: 100m
+        env:
+          - name: ELASTICSEARCH_URL
+            value: http://elasticsearch:9200
+        ports:
+        - containerPort: 5601
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fluentd
+  namespace: elkki
+  labels:
+    app: fluentd
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: fluentd
+  labels:
+    app: fluentd
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  - namespaces
+  verbs:
+  - get
+  - list
+  - watch
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fluent-bit-config
+  labels:
+    k8s-app: fluent-bit
+  namespace: elkki
+data:
+  fluent-bit.conf: |
+    [SERVICE]
+        Flush         1
+        Log_Level     info
+        Daemon        off
+        Parsers_File  parsers.conf
+        HTTP_Server   Off
+
+    @INCLUDE input-kubernetes.conf
+    @INCLUDE filter-kubernetes.conf
+    @INCLUDE output-elasticsearch.conf
+
+  input-kubernetes.conf: |
+
+    [INPUT]
+        Name tail
+        Tag kube.*
+        Path /var/log/containers/*.log
+        # Dirty haxx to strip certain namespaces and/or pods:
+        #Exclude_Path *kube-scheduler*,*kube-controller-manager*,*kube-apiserver*,*elkki*,*coredns*,*metrics-server*,*kube-proxy*,*etcd*
+        DB /var/log/flb_kube.db
+        Mem_Buf_Limit 5MB
+        Skip_Long_Lines On
+        Refresh_Interval 10
+        Parser crio
+
+  filter-kubernetes.conf: |
+
+    [FILTER]
+        Name parser
+        Match *
+        Key_Name log
+        Parser nginx
+        Parser traefik
+        Parser json
+
+    [FILTER]
+        Name                kubernetes
+        Match               kube.*
+        Kube_URL            https://kubernetes.default.svc:443
+        Kube_CA_File        /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        Kube_Token_File     /var/run/secrets/kubernetes.io/serviceaccount/token
+        Merge_Log           On
+        K8S-Logging.Parser  On
+        K8S-Logging.Exclude Off
+    
+
+  output-elasticsearch.conf: |
+
+    [OUTPUT]
+        Name es
+        Match *
+        Host ${FLUENT_ELASTICSEARCH_HOST}
+        Port ${FLUENT_ELASTICSEARCH_PORT}
+        Logstash_Format On
+        Logstash_Prefix logstash
+        Current_Time_Index On
+        Retry_Limit False
+        Type _doc
+
+  parsers.conf: |
+
+    [PARSER]
+        Name nginx
+        Format Regex
+        Key_Name log
+        Time_Key app_time
+        Regex (?<remote>[^ ]*) (?<host>[^ ]*) (?<user>[^ ]*) \[(?<app_time>[^\]]*)\] "(?<method>\S+)(?: +(?<path>[^\"]*?)(?: +\S*)?)?" (?<code>[^ ]*) (?<size>[^ ]*)(?: "(?<referer>[^\"]*)" "(?<agent>[^\"]*)")?$
+
+    [PARSER]
+        Name traefik
+        Format Regex
+        Key_Name log
+        Regex (?<remote>[\d.*]*) - (?<user>[^-]\S+ -|.) \[(?<app_time>.{26})\] \"(?<method>\S+) (?<path>\S+) (?<http_proto>\S+)\" (?<code>\d+) (?<bytes_sent>[^\"]*) \"(?<referer>[^\"]*)\" \"(?<agent>[^\"]*)\" (?<size>\d+) \"(?<upstream>[^\"]*)\" \"(?<upstream_addr>[^\"]*)\" (?<upstream_response_time>\d+)ms
+        Time_Key app_time
+
+    [PARSER]
+        Name json
+        Format json
+        Decode_Field_As escaped log
+
+    [PARSER]
+        Name crio
+        Format Regex
+        Regex ^(?<time>.+) (?<stream>stdout|stderr) \w (?<log>.*)$
+
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: fluent-bit
+  namespace: elkki
+  labels:
+    k8s-app: fluent-bit-logging
+    kubernetes.io/cluster-service: "true"
+  annotations:
+    wave.pusher.com/update-on-config-change: "true"
+spec:
+  selector:
+    matchLabels:
+      k8s-app: fluent-bit-logging
+  template:
+    metadata:
+      labels:
+        k8s-app: fluent-bit-logging
+        kubernetes.io/cluster-service: "true"
+    spec:
+      containers:
+      - name: fluent-bit
+        image: fluent/fluent-bit:1.1.1
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: FLUENT_ELASTICSEARCH_HOST
+          value: "elasticsearch"
+        - name: FLUENT_ELASTICSEARCH_PORT
+          value: "9200"
+        volumeMounts:
+        - name: varlog
+          mountPath: /var/log
+        - name: varlogcontainers
+          mountPath: /var/log/containers
+          readOnly: true
+        - name: fluent-bit-config
+          mountPath: /fluent-bit/etc/
+      terminationGracePeriodSeconds: 10
+      volumes:
+      - name: varlog
+        hostPath:
+          path: /var/log
+      - name: varlogcontainers
+        hostPath:
+          path: /var/log/containers
+      - name: fluent-bit-config
+        configMap:
+          name: fluent-bit-config
+      serviceAccountName: fluent-bit
+      tolerations:
+      - key: node-role.kubernetes.io/master
+        operator: Exists
+        effect: NoSchedule
+      - operator: "Exists"
+        effect: "NoExecute"
+      - operator: "Exists"
+        effect: "NoSchedule"
